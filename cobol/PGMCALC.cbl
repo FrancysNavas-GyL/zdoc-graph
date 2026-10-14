@@ -1,0 +1,17 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PGMCALC.
+
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+
+       01 WS-SALDO       PIC 9(7)V99.
+       01 WS-COMISION    PIC 9(5)V99.
+
+       PROCEDURE DIVISION.
+
+       CALCULAR.
+
+           MOVE 15000.00 TO WS-SALDO
+           COMPUTE WS-COMISION = WS-SALDO * 0.02
+
+           GOBACK.      
