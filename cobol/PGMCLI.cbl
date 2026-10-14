@@ -1,0 +1,39 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PGMCLI.
+
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+
+       01 WS-SALDO       PIC 9(7)V99.
+       01 WS-COMISION    PIC 9(5)V99.
+       01 WS-CATEGORIA   PIC X(10).
+       01 WS-TIPO        PIC X(20).
+
+       PROCEDURE DIVISION.
+
+           CALL 'PGM-EXTERNO'
+
+           PERFORM PROCESAR-CLIENTE
+
+           GOBACK.
+
+     PROCESAR-CLIENTE.
+
+        CALL 'PGM-VALIDACION'
+
+        PERFORM VALIDAR-CLIENTE
+
+        MOVE 15000.00 TO WS-SALDO
+        MOVE 'A' TO WS-TIPO
+
+        EVALUATE WS-CATEGORIA
+            WHEN 'A'
+                MOVE 'PREMIUM' TO WS-CATEGORIA
+            WHEN 'B'
+              MOVE 'NORMAL' TO WS-CATEGORIA
+            WHEN OTHER
+                 MOVE 'DESCONOCIDO' TO WS-CATEGORIA
+        END-EVALUATE.
+       VALIDAR-CLIENTE.
+
+           CONTINUE.
