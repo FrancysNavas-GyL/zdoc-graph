@@ -1,6 +1,6 @@
 """
-PASO 4: primera carga a Neo4j. Lee los COBOL desde Postgres (zdoc_raw_data), los pasa por el
-parser y escribe el grafo de LOGICA del programa en Neo4j. Postgres se abre en solo lectura.
+PASO 4: carga en Neo4j el grafo COBOL normalizado almacenado en PostgreSQL.
+Postgres se abre en solo lectura; el parser local se mantiene para análisis independiente.
 
     python step4_load_neo4j.py                        # carga todos los COBOL
     python step4_load_neo4j.py PGMCLI                 # carga un miembro
@@ -26,23 +26,18 @@ import psycopg2
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable
 
-from analysis.cobol_parser import parse_cobol
+from analysis.postgres_graph import (
+    ETIQUETAS_GRAFO,
+    NODOS_CON_PROGRAMA,
+    construir_subgrafo,
+    cargar_subgrafo,
+    leer_programas,
+)
 from config import NEO4J_DATABASE, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER, PG_CONFIG
 
-# Etiquetas que llevan la propiedad "program" (se borran y recrean al recargar un programa)
-POR_PROGRAMA = ["Operation", "When", "Evaluate", "Paragraph", "Variable"]
-TODAS = ["Program"] + POR_PROGRAMA
-
-SQL_FUENTES = """
-    SELECT m.id, p.nombre AS pds, m.nombre AS miembro, r.contenido
-      FROM zdoc_miembros m
-      JOIN zdoc_pds p       ON p.id = m.pds_id
-      JOIN zdoc_raw_data r  ON r.id = m.raw_data_id
-     WHERE m.tipo = 'COBOL'
-       AND (%(pds)s IS NULL OR p.nombre = %(pds)s)
-       AND (%(miembro)s IS NULL OR m.nombre = %(miembro)s)
-     ORDER BY p.nombre, m.nombre
-"""
+# Etiquetas de los nodos generados por el cargador.
+POR_PROGRAMA = NODOS_CON_PROGRAMA
+TODAS = ETIQUETAS_GRAFO
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +94,8 @@ def preparar(r):
 # ---------------------------------------------------------------------------
 # Parte 2: escritura en Neo4j (una transaccion por programa)
 # ---------------------------------------------------------------------------
+
+
 def cargar_programa(tx, pds, miembro, member_id, d):
     prog = d["prog"]
 
@@ -182,9 +179,12 @@ def cargar_programa(tx, pds, miembro, member_id, d):
 
 
 def crear_esquema(driver):
-    """Claves unicas e indices (los indices evitan recorrer todo el grafo en cada recarga)."""
+    """Crea claves unicas e indices necesarios para buscar nodos por programa."""
     for etiqueta, prop in [("Program", "name"), ("Paragraph", "uid"), ("Variable", "uid"),
-                           ("Operation", "uid"), ("Evaluate", "uid"), ("When", "uid")]:
+                           ("Operation", "uid"), ("Evaluate", "uid"), ("When", "uid"),
+                           ("Member", "uid"), ("PDS", "uid"), ("RawData", "uid"),
+                           *((label, "uid") for label in POR_PROGRAMA if label not in
+                             {"Paragraph", "Variable", "Operation", "Evaluate", "When"})]:
         driver.execute_query(
             f"CREATE CONSTRAINT zdoc_{etiqueta.lower()}_{prop} IF NOT EXISTS "
             f"FOR (n:{etiqueta}) REQUIRE n.{prop} IS UNIQUE", database_=NEO4J_DATABASE)
@@ -243,45 +243,49 @@ def main():
             wipe(driver)
             return
 
-        conn = psycopg2.connect(**PG_CONFIG)
-        conn.set_session(readonly=True)
-        with conn, conn.cursor() as cur:
-            cur.execute(SQL_FUENTES, {"pds": args.pds,
-                                      "miembro": args.miembro.upper() if args.miembro else None})
-            fuentes = cur.fetchall()
-        conn.close()
-        if not fuentes:
-            sys.exit("No hay miembros COBOL con fuente en zdoc_raw_data para ese filtro.")
-        if args.limit:
-            fuentes = fuentes[:args.limit]
-
         crear_esquema(driver)
 
         cargados, problemas, vistos = 0, [], {}
+        conn = psycopg2.connect(**PG_CONFIG)
+        conn.set_session(readonly=True)
+        with conn, conn.cursor() as cur:
+            programas = leer_programas(cur, args.pds,
+                                       args.miembro.upper() if args.miembro else None)
+            if args.limit:
+                programas = programas[:args.limit]
+            grafos = []
+            for programa in programas:
+                try:
+                    grafos.append((programa, construir_subgrafo(cur, programa)))
+                except Exception as e:
+                    problemas.append((programa["pds"], programa["miembro"],
+                                      f"{type(e).__name__}: {e}"))
+        conn.close()
+        if not programas:
+            sys.exit("No hay programas normalizados en zdoc_cobol para ese filtro.")
+
         primer_error = True
-        for member_id, pds, miembro, texto in fuentes:
-            try:
-                r = parse_cobol(texto)
-                if not r["program"]:
-                    raise ValueError("no se encontro PROGRAM-ID")
-                if r["program"] in vistos:
-                    raise ValueError(f"PROGRAM-ID duplicado (ya cargado desde {vistos[r['program']]})")
-                d = preparar(r)
-                # sesion nueva por programa: si una conexion se rompe, no arrastra a las demas
-                with driver.session(database=NEO4J_DATABASE) as session:
-                    session.execute_write(cargar_programa, pds, miembro, member_id, d)
-            except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                problemas.append((pds, miembro, msg))
-                print(f"  ERROR  {pds}({miembro}): {msg}")
-                if primer_error:
-                    traceback.print_exc()
-                    primer_error = False
-                continue
-            vistos[r["program"]] = f"{pds}({miembro})"
-            cargados += 1
-            print(f"  OK     {pds}({miembro}) -> {d['prog']}: {len(d['variables'])} vars, "
-                  f"{len(d['parrafos'])} parrafos, {len(d['ops'])} operaciones, {len(d['calls'])} calls")
+        with driver.session(database=NEO4J_DATABASE) as session:
+            for p, d in grafos:
+                pds, miembro, program_id = p["pds"], p["miembro"], p["program_id"]
+                try:
+                    if program_id in vistos:
+                        raise ValueError(f"PROGRAM-ID duplicado (ya cargado desde {vistos[program_id]})")
+                    session.execute_write(cargar_subgrafo, pds, miembro, p["miembro_id"], d)
+                except Exception as e:
+                    msg = f"{type(e).__name__}: {e}"
+                    problemas.append((pds, miembro, msg))
+                    print(f"  ERROR  {pds}({miembro}): {msg}")
+                    if primer_error:
+                        traceback.print_exc()
+                        primer_error = False
+                    continue
+                vistos[program_id] = f"{pds}({miembro})"
+                cargados += 1
+                counts = {label: len(items) for label, items in d["nodes"].items()}
+                print(f"  OK     {pds}({miembro}) -> {program_id}: "
+                      f"{counts.get('CobolVariable', 0)} vars, {counts.get('Paragraph', 0)} parrafos, "
+                      f"{counts.get('Operation', 0)} operaciones, {counts.get('CobolCall', 0)} calls")
 
         print(f"\nCargados: {cargados}   Con problemas: {len(problemas)}")
         resumen(driver)
